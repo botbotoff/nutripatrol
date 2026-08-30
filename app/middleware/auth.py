@@ -72,12 +72,15 @@ async def auth_dependency(request: Request, user_status: UserStatus):
     # Currently, this is only for robotoff
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
+        env_token = os.getenv("AUTH_BEARER_TOKEN_ROBOTOFF")
+        if not env_token:
+            # Without a configured token there is nothing to compare against,
+            # so no bearer token can be considered valid.
+            raise HTTPException(status_code=403, detail="Invalid bearer token")
         # Check if hashed token matches the env variable
         token = auth_header.split(" ")[1]
         hashed_token = hashlib.sha256(token.encode()).hexdigest()
-        hashed_env_token = hashlib.sha256(
-            os.getenv("AUTH_BEARER_TOKEN_ROBOTOFF").encode()
-        ).hexdigest()
+        hashed_env_token = hashlib.sha256(env_token.encode()).hexdigest()
         if hashed_token != hashed_env_token:
             raise HTTPException(status_code=403, detail="Invalid bearer token")
         return  # If the token is valid, we just return

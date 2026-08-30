@@ -39,6 +39,11 @@ To get a local copy up and running, follow these simple steps.
 
 ### **Prerequisites**
 
+- A running Docker daemon and the Compose plugin (`docker compose`). On Ubuntu,
+  `sudo apt install docker.io docker-compose-v2` is enough — no Docker Hub account
+  is needed, the only images pulled from Hub are `postgres` and `nginx`.
+- `make`.
+
 ### **Installation**
 
 1. Clone this repository :
@@ -59,16 +64,56 @@ Make docker containers
 make up
 ```
 
-Your local instance of NutriPatrol should now be running at http://localhost:3000.
+Then apply the database migrations. This step is required: nothing creates the tables
+at startup, so every endpoint that touches the database fails until you run it.
+
+```console
+make migrate-db
+```
+
+The API should now be running at <http://localhost:8000>, with the interactive
+documentation at <http://localhost:8000/api/docs>.
+
+Note that <http://localhost:8000/> itself returns a 403 in a dev checkout: nginx serves
+the `static/` directory there, and that directory only holds the built frontend in
+production. This is expected — use `/api/docs` to check that the API is alive.
+
+The frontend is a separate repository
+([nutripatrol-frontend](https://github.com/openfoodfacts/nutripatrol-frontend)) and runs
+on <http://localhost:5173>.
+
 ### Authentication for local dev
 
-### To test with a global instance of Product Opener
+Every useful endpoint requires authentication, so this section is not optional if you
+want to do anything beyond `/api/docs`.
 
-In .env file uncomment the AUTH_SERVER_STATIC variable.
+#### To test with a global instance of Product Opener
+
+In the .env file uncomment the AUTH_SERVER_STATIC variable.
 If you want to use a local Product Opener Instance, use `http://world.openfoodfacts.localhost`
 
+This variable is **required for local development**. Without it the API derives the
+authentication server from the request host by replacing `nutripatrol` with `world`
+(see `app/middleware/auth.py`). On `http://localhost:8000` there is nothing to replace,
+so it ends up calling `https://localhost:8000/cgi/auth.pl` and every login fails.
+
+Make sure it points at the same environment as `OFF_TLD` in the same file — a session
+cookie taken from `openfoodfacts.org` will not match flag URLs generated for
+`openfoodfacts.net`.
+
 Then connect to your Open Food Facts profile, copy the session cookie (use developper toolbar, and find a cookie named session for openfoodfacts.org domain, copy its value)
-and paste it in the body at this endpoint /api/set_session_cookie (you have a form at the /api/docs URI).
+and paste it in the body at this endpoint /api/v1/set_session_cookie (you have a form at the /api/docs URI).
+
+#### Without an Open Food Facts moderator account
+
+A bearer token short-circuits the authentication dependency entirely, which is the
+quickest way to exercise the API locally. It is set to `local-dev-token` in the
+committed dev `.env`:
+
+```console
+curl -H "Authorization: Bearer local-dev-token" \
+  "http://localhost:8000/api/v1/tickets?type_=image&status=open&page=1&page_size=10"
+```
 
 ## **📖 Usage**
 
