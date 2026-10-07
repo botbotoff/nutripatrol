@@ -297,3 +297,18 @@ def test_a_source_url_must_look_like_one(database, logged_in):
         ).status_code
         == 422
     )
+
+
+def test_a_product_of_another_project_names_that_project(database, logged_in):
+    response = post_flag(reason="not_a_product", extra_data={"correct_flavor": "obf"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["extra_data"] == {"correct_flavor": "obf"}
+
+
+def test_the_other_project_must_be_one_a_product_can_move_to(database, logged_in):
+    response = post_flag(
+        reason="not_a_product", extra_data={"correct_flavor": "off_pro"}
+    )
+
+    assert response.status_code == 422
