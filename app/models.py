@@ -68,11 +68,43 @@ class TicketModel(Model):
         table_name = "tickets"
 
 
+class TicketIssueModel(Model):
+    """A GitHub issue of openfoodfacts/openfoodfacts-server linked to a ticket.
+
+    Moderators open the issue themselves on GitHub, for a problem that comes
+    from how Open Food Facts computes something, and paste its link back.
+    `title`, `state` and `state_reason` are a cache of what GitHub said when
+    `checked_at`, refreshed when the ticket's issues are read.
+
+    Unlinking only sets `removed_at`, so that the `issue_unlinked` action
+    still says which issue it was about.
+    """
+
+    ticket = ForeignKeyField(TicketModel, backref="issues", index=True)
+    number = IntegerField()
+    url = TextField()
+    title = TextField(null=True)
+    state = CharField(max_length=20, null=True)
+    state_reason = CharField(max_length=20, null=True)
+    checked_at = DateTimeField(null=True)
+    user_id = TextField()
+    created_at = DateTimeField()
+    removed_at = DateTimeField(null=True)
+
+    class Meta:
+        database = db
+        table_name = "ticket_issues"
+        indexes = ((("ticket", "number"), True),)
+
+
 class ModeratorActionModel(Model):
     action_type = CharField(max_length=20)
     user_id = TextField()
     ticket = ForeignKeyField(TicketModel, backref="moderator_actions")
     created_at = DateTimeField()
+    # The issue linked or unlinked, on `issue_linked` / `issue_unlinked`
+    # actions.
+    issue = ForeignKeyField(TicketIssueModel, null=True, backref="actions")
 
     class Meta:
         database = db

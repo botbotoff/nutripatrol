@@ -28,6 +28,7 @@ from app.flag_reasons import (
     IssueType,
     ReasonType,
 )
+from app.github_api import IssueNotFound, fetch_issue, issue_url, parse_issue_url
 from app.middleware.auth import (
     AuthenticatedUser,
     ModeratorSession,
@@ -40,6 +41,7 @@ from app.models import (
     FlagModel,
     ModeratorActionModel,
     TicketCommentModel,
+    TicketIssueModel,
     TicketModel,
     db,
 )
@@ -95,6 +97,10 @@ A ticket containes the following main fields:
 
 Moderators can comment on a ticket (`POST /tickets/{ticket_id}/comments`), or comment and close it in one call (`POST /tickets/{ticket_id}/close_with_comment`). A comment is recorded as a moderator action of type `comment`, so it appears in the ticket history; closing with a comment records the comment, then the status change one millisecond later. Comments are visible to the moderators and to the users who flagged the ticket.
 
+## GitHub issues
+
+When a report comes from how Open Food Facts computes something (Nutri-Score, NOVA, Eco-Score...), a moderator opens an issue on [openfoodfacts/openfoodfacts-server](https://github.com/openfoodfacts/openfoodfacts-server) and links it to the ticket with `POST /tickets/{ticket_id}/issues`. Linking and unlinking (`DELETE /tickets/{ticket_id}/issues/{issue_id}`) are recorded as `issue_linked` and `issue_unlinked` moderator actions. `GET /tickets/{ticket_id}/issues` lists the linked issues with their state, refreshed from GitHub when it is more than 15 minutes old; tickets carry the `issues` as last checked.
+
 ## Moderation actions
 
 Closing a ticket only records what a moderator decided; acting on it means editing Open Food Facts. The `/products/{barcode}/...` endpoints do that server-side, so that a client does not have to know the Open Food Facts endpoints, which flavor a product lives on, or how each of them reports a failure:
@@ -116,8 +122,9 @@ Every endpoint requires an Open Food Facts session. Moderators see everything. A
 - `GET /tickets` and `GET /tickets/{ticket_id}`: the tickets one of their flags is attached to. A ticket gathers the flags of everyone who reported the same product or image, so reaching it through one's own flag does not hand over the others: `POST /flags/batch` returns, of a shared ticket, only the caller's own flag.
 - `GET /tickets/{ticket_id}/actions`: the moderation history of those tickets, so that a flagger can see what was done about their report.
 - `GET /tickets/{ticket_id}/comments`: the comments moderators wrote on those tickets.
+- `GET /tickets/{ticket_id}/issues`: the GitHub issues linked to those tickets.
 
-Closing a ticket, commenting on it, and everything under `/products/{barcode}/...`, stays with the moderators, as do `GET /stats` and `GET /moderator_actions/me`.
+Closing a ticket, commenting on it, linking issues to it, and everything under `/products/{barcode}/...`, stays with the moderators, as do `GET /stats` and `GET /moderator_actions/me`.
 
 """
 
@@ -209,6 +216,10 @@ class ActionType(StrEnum):
     # A moderator commented on the ticket. The comment itself is in
     # `ticket_comments`, linked to the action.
     comment = "comment"
+    # A moderator linked a GitHub issue to the ticket, or unlinked it. The
+    # issue is in `ticket_issues`, linked to the action.
+    issue_linked = "issue_linked"
+    issue_unlinked = "issue_unlinked"
 
 
 class TicketCreate(BaseModel):
@@ -235,6 +246,54 @@ class TicketCreate(BaseModel):
     )
 
 
+class TicketIssue(BaseModel):
+    id: int = Field(..., description="ID of the link between the ticket and the issue")
+    ticket_id: int = Field(..., description="ID of the ticket")
+    number: int = Field(
+        ..., description="Number of the issue in openfoodfacts/openfoodfacts-server"
+    )
+    url: str = Field(..., description="URL of the issue on GitHub")
+    title: str | None = Field(
+        None, description="Title of the issue, as GitHub last reported it"
+    )
+    state: str | None = Field(
+        None,
+        description="`open` or `closed`, as GitHub last reported it. Null if "
+        "GitHub could not be reached yet.",
+    )
+    state_reason: str | None = Field(
+        None,
+        description="Why a closed issue was closed (`completed`, `not_planned`, "
+        "`duplicate`), as GitHub last reported it",
+    )
+    checked_at: datetime | None = Field(
+        None, description="When GitHub was last asked about the issue"
+    )
+    user_id: str = Field(
+        ..., description="Open Food Facts User ID of the moderator who linked it"
+    )
+    created_at: datetime = Field(..., description="When it was linked")
+    removed_at: datetime | None = Field(
+        None, description="When it was unlinked, if it was"
+    )
+
+
+def _issue_as_response(issue: TicketIssueModel) -> TicketIssue:
+    return TicketIssue(
+        id=issue.id,
+        ticket_id=issue.ticket_id,
+        number=issue.number,
+        url=issue.url,
+        title=issue.title,
+        state=issue.state,
+        state_reason=issue.state_reason,
+        checked_at=issue.checked_at,
+        user_id=issue.user_id,
+        created_at=issue.created_at,
+        removed_at=issue.removed_at,
+    )
+
+
 class Ticket(TicketCreate):
     id: int = Field(..., description="ID of the ticket")
     image_uploader: str | None = Field(
@@ -248,6 +307,11 @@ class Ticket(TicketCreate):
     )
     comment_count: int = Field(
         0, description="Number of comments moderators wrote on the ticket"
+    )
+    issues: list[TicketIssue] = Field(
+        default_factory=list,
+        description="GitHub issues linked to the ticket, with their state as "
+        "last checked. `GET /tickets/{id}/issues` refreshes it.",
     )
 
 
@@ -714,8 +778,12 @@ def _create_ticket(ticket: TicketCreate, snapshot: ProductSnapshot):
     )
 
 
-def _with_comment_counts(tickets: list[dict]) -> list[dict]:
-    """Add its `comment_count` to each ticket, in one query for all of them."""
+def _with_ticket_details(tickets: list[dict]) -> list[dict]:
+    """Add its `comment_count` and `issues` to each ticket.
+
+    One query each for all the tickets, rather than per ticket. The issues
+    come as last checked: GitHub is not called for a list.
+    """
     ticket_ids = [ticket["id"] for ticket in tickets]
     counts = {}
     if ticket_ids:
@@ -727,13 +795,29 @@ def _with_comment_counts(tickets: list[dict]) -> list[dict]:
             .group_by(TicketCommentModel.ticket)
             .tuples()
         )
+    issues = defaultdict(list)
+    if ticket_ids:
+        for issue in (
+            TicketIssueModel.select()
+            .where(
+                TicketIssueModel.ticket.in_(ticket_ids),
+                TicketIssueModel.removed_at.is_null(),
+            )
+            .order_by(TicketIssueModel.created_at, TicketIssueModel.id)
+        ):
+            issues[issue.ticket_id].append(_issue_as_response(issue))
     return [
-        {**ticket, "comment_count": counts.get(ticket["id"], 0)} for ticket in tickets
+        {
+            **ticket,
+            "comment_count": counts.get(ticket["id"], 0),
+            "issues": issues[ticket["id"]],
+        }
+        for ticket in tickets
     ]
 
 
 def _ticket_as_response(ticket: TicketModel) -> dict:
-    return _with_comment_counts([model_to_dict(ticket)])[0]
+    return _with_ticket_details([model_to_dict(ticket)])[0]
 
 
 class GetTicketsResponse(BaseModel):
@@ -818,7 +902,7 @@ def get_tickets(
         sort_field = TICKET_SORTABLE_FIELDS[sort_by]
         order_expr = sort_field.asc() if sort_order == "asc" else sort_field.desc()
         return GetTicketsResponse(
-            tickets=_with_comment_counts(
+            tickets=_with_ticket_details(
                 list(query.order_by(order_expr).offset(offset).limit(page_size).dicts())
             ),
             max_page=max_page,
@@ -1184,17 +1268,182 @@ def close_ticket_with_comment(
         return _ticket_as_response(ticket)
 
 
+#: How long the state of a linked issue is trusted before asking GitHub again.
+ISSUE_STATE_MAX_AGE = timedelta(minutes=15)
+
+
+class IssueLink(BaseModel):
+    url: str = Field(
+        ...,
+        description="URL of an issue of openfoodfacts/openfoodfacts-server",
+        examples=["https://github.com/openfoodfacts/openfoodfacts-server/issues/1"],
+    )
+
+
+class GetIssuesResponse(BaseModel):
+    issues: list[TicketIssue]
+
+
+def _store_github_state(issue: TicketIssueModel, now: datetime) -> None:
+    """Refresh the cached title and state of an issue, best effort.
+
+    An issue GitHub no longer knows (deleted, or transferred elsewhere) keeps
+    its last known state: it was real when it was linked.
+    """
+    try:
+        _check_issue_exists(issue, now)
+    except IssueNotFound:
+        issue.checked_at = now
+
+
+@api_v1_router.get("/tickets/{ticket_id}/issues")
+def get_ticket_issues(
+    ticket_id: int, user: AuthenticatedUser = Depends(authenticated_user)
+) -> GetIssuesResponse:
+    """Get the GitHub issues linked to a ticket, oldest first.
+
+    Their state is refreshed from GitHub when it is more than 15 minutes old,
+    best effort. Readable by the moderators, and by the users who flagged the
+    ticket: the issues are public anyway.
+    """
+    with db:
+        _authorize_ticket_access(ticket_id, user)
+        _get_ticket_or_404(ticket_id)
+        issues = list(
+            TicketIssueModel.select()
+            .where(
+                TicketIssueModel.ticket == ticket_id,
+                TicketIssueModel.removed_at.is_null(),
+            )
+            .order_by(TicketIssueModel.created_at, TicketIssueModel.id)
+        )
+        now = datetime.utcnow()
+        for issue in issues:
+            if issue.checked_at is None or now - issue.checked_at > ISSUE_STATE_MAX_AGE:
+                _store_github_state(issue, now)
+                issue.save()
+        return GetIssuesResponse(issues=[_issue_as_response(i) for i in issues])
+
+
+@api_v1_router.post("/tickets/{ticket_id}/issues")
+def link_ticket_issue(
+    ticket_id: int,
+    body: IssueLink,
+    user_id: str = Depends(get_auth_dependency(UserStatus.isModerator)),
+) -> TicketIssue:
+    """Link a GitHub issue of openfoodfacts/openfoodfacts-server to a ticket.
+
+    The moderator opens the issue on GitHub, then pastes its URL here. It is
+    recorded as an `issue_linked` moderator action. Linking an issue that is
+    already linked returns it and records nothing.
+    """
+    number = parse_issue_url(body.url)
+    if number is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Not the URL of an issue of openfoodfacts/openfoodfacts-server",
+        )
+    with db:
+        ticket = _get_ticket_or_404(ticket_id)
+        issue = TicketIssueModel.get_or_none(
+            TicketIssueModel.ticket == ticket, TicketIssueModel.number == number
+        )
+        if issue is not None and issue.removed_at is None:
+            return _issue_as_response(issue)
+
+        now = datetime.utcnow()
+        if issue is None:
+            issue = TicketIssueModel(
+                ticket=ticket, number=number, url=issue_url(number)
+            )
+        try:
+            _check_issue_exists(issue, now)
+        except IssueNotFound:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Issue #{number} not found in openfoodfacts/openfoodfacts-server",
+            )
+        # Relinking brings back an issue unlinked earlier, as the new linker's.
+        issue.user_id = user_id
+        issue.created_at = now
+        issue.removed_at = None
+        with db.atomic():
+            issue.save()
+            ModeratorActionModel.create(
+                ticket=ticket,
+                user_id=user_id,
+                action_type=ActionType.issue_linked,
+                issue=issue,
+                created_at=now,
+            )
+        return _issue_as_response(issue)
+
+
+def _check_issue_exists(issue: TicketIssueModel, now: datetime) -> None:
+    """Copy the title and state GitHub has for an issue.
+
+    Raises IssueNotFound if GitHub says it does not exist. If GitHub cannot
+    tell, the issue is left as it is and `checked_at` unchanged, so that it is
+    asked again next time.
+    """
+    github_issue = fetch_issue(issue.number)
+    if github_issue is None:
+        return
+    issue.title = github_issue.title
+    issue.state = github_issue.state
+    issue.state_reason = github_issue.state_reason
+    issue.checked_at = now
+
+
+@api_v1_router.delete("/tickets/{ticket_id}/issues/{issue_id}")
+def unlink_ticket_issue(
+    ticket_id: int,
+    issue_id: int,
+    user_id: str = Depends(get_auth_dependency(UserStatus.isModerator)),
+) -> TicketIssue:
+    """Unlink a GitHub issue from a ticket.
+
+    Recorded as an `issue_unlinked` moderator action. The issue itself is
+    left alone on GitHub.
+    """
+    with db:
+        issue = TicketIssueModel.get_or_none(
+            TicketIssueModel.id == issue_id,
+            TicketIssueModel.ticket == ticket_id,
+            TicketIssueModel.removed_at.is_null(),
+        )
+        if issue is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        now = datetime.utcnow()
+        issue.removed_at = now
+        with db.atomic():
+            issue.save()
+            ModeratorActionModel.create(
+                ticket=ticket_id,
+                user_id=user_id,
+                action_type=ActionType.issue_unlinked,
+                issue=issue,
+                created_at=now,
+            )
+        return _issue_as_response(issue)
+
+
 class ModeratorAction(BaseModel):
     id: int = Field(..., description="ID of the moderator action")
     action_type: ActionType = Field(
         ...,
-        description="What the action did: the ticket status it set, or `comment`",
+        description="What the action did: the ticket status it set, `comment`, "
+        "`issue_linked` or `issue_unlinked`",
     )
     user_id: str = Field(..., description="Open Food Facts User ID of the moderator")
     ticket_id: int = Field(..., description="ID of the ticket this action was taken on")
     created_at: datetime = Field(..., description="When the action was taken")
     comment: TicketComment | None = Field(
         None, description="The comment, on a `comment` action"
+    )
+    issue: TicketIssue | None = Field(
+        None,
+        description="The GitHub issue, on `issue_linked` and `issue_unlinked` actions",
     )
 
 
@@ -1231,6 +1480,16 @@ def _list_moderator_actions(
                 TicketCommentModel.moderator_action.in_([a.id for a in actions])
             )
         }
+    # Likewise for the issues the page's actions linked or unlinked.
+    issue_ids = {a.issue_id for a in actions if a.issue_id is not None}
+    issues = {}
+    if issue_ids:
+        issues = {
+            issue.id: _issue_as_response(issue)
+            for issue in TicketIssueModel.select().where(
+                TicketIssueModel.id.in_(issue_ids)
+            )
+        }
     return GetModeratorActionsResponse(
         actions=[
             ModeratorAction(
@@ -1240,6 +1499,7 @@ def _list_moderator_actions(
                 ticket_id=action.ticket_id,
                 created_at=action.created_at,
                 comment=comments.get(action.id),
+                issue=issues.get(action.issue_id),
             )
             for action in actions
         ],

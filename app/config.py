@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # moderator rights.
     auth_dev_users: bool = False
     migration_dir: Path = PROJECT_DIR / "migrations"
+    # Optional GitHub token, only used to read the state of the issues linked
+    # to tickets. GitHub serves public issues without one, but limits that to
+    # 60 requests an hour per IP address. It needs no permission at all.
+    github_token: str | None = None
 
 
 settings = Settings()
