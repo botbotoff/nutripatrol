@@ -14,6 +14,7 @@ x-api-common: &api-common
     - AUTH_SERVER_STATIC
     - AUTH_DEV_USERS
     - AUTH_BEARER_TOKEN_ROBOTOFF
+    - GITHUB_TOKEN
   networks:
     - default
 
