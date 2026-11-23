@@ -253,6 +253,72 @@ def test_a_moderator_lists_every_ticket(database, act_as):
     )
 
 
+THIRD_BARCODE = "5449000000996"
+
+
+def test_filters_and_paging_only_narrow_what_a_user_may_read(database, act_as):
+    """Every filter is ANDed with the visibility rule, never instead of it:
+    the count, the pages and the rows all stay within the user's tickets."""
+    open_flag = flag_of(act_as, "alice")
+    closed_flag = flag_of(act_as, "alice", barcode=OTHER_BARCODE)
+    close(closed_flag["ticket_id"], act_as)
+    # Bob's open ticket matches every filter below, but is not Alice's.
+    flag_of(act_as, "bob", barcode=THIRD_BARCODE)
+
+    act_as("alice")
+    response = request(
+        "GET", "/api/v1/tickets?status=open&flavor=off&type_=product&page_size=1"
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [ticket["id"] for ticket in body["tickets"]] == [open_flag["ticket_id"]]
+    assert body["total"] == 1
+    assert body["max_page"] == 1
+
+
+def test_a_user_pages_through_their_own_tickets_only(database, act_as):
+    first = flag_of(act_as, "alice")
+    second = flag_of(act_as, "alice", barcode=OTHER_BARCODE)
+    flag_of(act_as, "bob", barcode=THIRD_BARCODE)
+
+    act_as("alice")
+    pages = [
+        request(
+            "GET", f"/api/v1/tickets?sort_by=id&sort_order=asc&page_size=1&page={page}"
+        ).json()
+        for page in (1, 2, 3)
+    ]
+
+    assert [[t["id"] for t in page["tickets"]] for page in pages] == [
+        [first["ticket_id"]],
+        [second["ticket_id"]],
+        [],
+    ]
+    assert {page["total"] for page in pages} == {2}
+    assert {page["max_page"] for page in pages} == {2}
+
+
+def test_a_user_matches_a_ticket_on_the_reason_they_gave(database, act_as):
+    alice_flag = flag_of(act_as, "alice", reason="inappropriate")
+    flag_of(act_as, "bob", reason="other")
+
+    act_as("alice")
+    response = request("GET", "/api/v1/tickets?reason=inappropriate")
+
+    assert [t["id"] for t in response.json()["tickets"]] == [alice_flag["ticket_id"]]
+
+
+def test_a_moderator_matches_a_ticket_on_anyone_s_reason(database, act_as):
+    flag_of(act_as, "alice", reason="other")
+    bob_flag = flag_of(act_as, "bob", reason="inappropriate")
+
+    act_as("mod", moderator=1)
+    response = request("GET", "/api/v1/tickets?reason=inappropriate")
+
+    assert [t["id"] for t in response.json()["tickets"]] == [bob_flag["ticket_id"]]
+
+
 # --- Reading what was done about it ------------------------------------------
 
 
@@ -281,6 +347,16 @@ def test_a_user_cannot_read_the_actions_of_a_ticket_they_did_not_flag(database, 
 
     act_as("alice")
     response = request("GET", f"/api/v1/tickets/{bob_flag['ticket_id']}/actions")
+
+    assert response.status_code == 404, response.text
+
+
+def test_the_actions_of_an_unknown_ticket_are_a_404_for_a_moderator_too(
+    database, act_as
+):
+    """Like the ticket and its comments: one answer for "no such ticket"."""
+    act_as("mod", moderator=1)
+    response = request("GET", "/api/v1/tickets/999/actions")
 
     assert response.status_code == 404, response.text
 

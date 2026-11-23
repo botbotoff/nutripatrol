@@ -19,6 +19,7 @@ from peewee import DoesNotExist, fn
 from playhouse.shortcuts import model_to_dict
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from app.access import get_visible_ticket_or_404, visible_flags, visible_tickets
 from app.config import settings
 from app.flag_extra_data import EXTRA_DATA_MODELS
 from app.flag_reasons import (
@@ -615,49 +616,6 @@ def create_flag(
         )
 
 
-def _own_flag_clause(user: AuthenticatedUser) -> list:
-    """The `where` terms that keep a query to the flags `user` raised.
-
-    Such flags are left to the moderators, who read every flag.
-    """
-    return [
-        FlagModel.user_id == user.user_id,
-        FlagModel.user_id != "",
-        FlagModel.user_id.is_null(False),
-    ]
-
-
-def _readable_flags(user: AuthenticatedUser):
-    """The flags `user` may read, as a query to narrow further.
-
-    Every flag for a moderator, and only one's own for anyone else.
-    """
-    if user.is_moderator:
-        return FlagModel.select()
-    return FlagModel.select().where(*_own_flag_clause(user))
-
-
-def _authorize_ticket_access(ticket_id: int, user: AuthenticatedUser) -> None:
-    """Refuse a plain user a ticket that none of their own flags opened.
-
-    A ticket gathers the flags of everyone who reported the same product or
-    image, so reaching it through one's own flag must not hand over the
-    others: it is only the ticket itself, and its moderation history, that a
-    flagger gets to follow.
-    """
-    if user.is_moderator:
-        return
-    own_flag = (
-        FlagModel.select()
-        .where(FlagModel.ticket == ticket_id, *_own_flag_clause(user))
-        .exists()
-    )
-    if not own_flag:
-        # 404 rather than 403, as with a flag: which products other users
-        # have reported is not something a flagger gets to probe for.
-        raise HTTPException(status_code=404, detail="Not found")
-
-
 def _flag_as_response(flag: FlagModel) -> dict:
     """Render a flag the way the API describes it.
 
@@ -684,7 +642,7 @@ def get_flags(
     raised themselves, and only those.
     """
     with db:
-        query = _readable_flags(user)
+        query = visible_flags(user)
         return GetFlagsResponse(flags=[_flag_as_response(flag) for flag in query])
 
 
@@ -699,7 +657,7 @@ def get_flag(
     reported a given product is itself part of what the flag discloses.
     """
     with db:
-        flag = _readable_flags(user).where(FlagModel.id == flag_id).first()
+        flag = visible_flags(user).where(FlagModel.id == flag_id).first()
         if flag is None:
             raise HTTPException(status_code=404, detail="Not found")
         return flag
@@ -781,33 +739,24 @@ def get_tickets(
         )
     with db:
         offset = (page - 1) * page_size
-        # Get IDs of flags with the specified filters
-        where_clause = []
+        # Only what `user` may read, then narrowed by the filters: each
+        # `.where()` is ANDed with the visibility rule, never instead of it.
+        query = visible_tickets(user)
         if barcode:
-            where_clause.append(TicketModel.barcode == barcode)
+            query = query.where(TicketModel.barcode == barcode)
         if status:
-            where_clause.append(TicketModel.status == status)
+            query = query.where(TicketModel.status == status)
         if type_:
-            where_clause.append(TicketModel.type == type_)
+            query = query.where(TicketModel.type == type_)
         if flavor:
-            where_clause.append(TicketModel.flavor == flavor)
-        # Both the tickets a plain user may see and the `reason` filter
-        # select tickets through their flags, so they go through the same
-        # subquery -- which also keeps a plain user from matching a ticket on
-        # the reason someone else gave.
-        flag_clause = [] if user.is_moderator else _own_flag_clause(user)
+            query = query.where(TicketModel.flavor == flavor)
         if reason:
-            flag_clause.append(FlagModel.reason.in_(reason))
-        if flag_clause:
-            subquery = FlagModel.select(FlagModel.ticket_id).where(*flag_clause)
-            where_clause.append(TicketModel.id.in_(subquery))
-
-        # peewee's .where() raises on zero arguments (reduce() of an empty
-        # iterable), so only apply it when there is at least one filter --
-        # this is the plain, unfiltered "list everything" query otherwise.
-        query = TicketModel.select()
-        if where_clause:
-            query = query.where(*where_clause)
+            # Through the flags `user` may read, so that a plain user cannot
+            # match a ticket on the reason someone else gave.
+            reason_flags = visible_flags(user).where(FlagModel.reason.in_(reason))
+            query = query.where(
+                TicketModel.id.in_(reason_flags.select(FlagModel.ticket))
+            )
 
         # Get the total number of tickets with the specified filters
         count = query.count()
@@ -835,11 +784,7 @@ def get_ticket(
     Readable by the moderators, and by the users who flagged it.
     """
     with db:
-        _authorize_ticket_access(ticket_id, user)
-        try:
-            return _ticket_as_response(TicketModel.get_by_id(ticket_id))
-        except DoesNotExist:
-            raise HTTPException(status_code=404, detail="Not found")
+        return _ticket_as_response(get_visible_ticket_or_404(user, ticket_id))
 
 
 @api_v1_router.post("/flags/batch")
@@ -854,7 +799,7 @@ def get_flags_by_ticket_batch(
     flag alone. A ticket they did not flag is simply absent from the answer.
     """
     with db:
-        query = _readable_flags(user).where(
+        query = visible_flags(user).where(
             FlagModel.ticket_id.in_(flag_request.ticket_ids)
         )
         flags = list(query.dicts())
@@ -1130,8 +1075,7 @@ def get_ticket_comments(
     Readable by the moderators, and by the users who flagged the ticket.
     """
     with db:
-        _authorize_ticket_access(ticket_id, user)
-        _get_ticket_or_404(ticket_id)
+        get_visible_ticket_or_404(user, ticket_id)
         query = TicketCommentModel.select().where(
             TicketCommentModel.ticket == ticket_id
         )
@@ -1260,7 +1204,7 @@ def get_ticket_actions(
     was done about a report is answered to whoever made it.
     """
     with db:
-        _authorize_ticket_access(ticket_id, user)
+        get_visible_ticket_or_404(user, ticket_id)
         return _list_moderator_actions(
             [ModeratorActionModel.ticket == ticket_id], page, page_size
         )
